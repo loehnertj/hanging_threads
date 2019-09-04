@@ -39,6 +39,7 @@ import sys
 import threading
 import linecache
 import time
+import ctypes
 
 __version__ = "development"
 __author__ = "Nicco Kunzmann"
@@ -49,7 +50,8 @@ TEST_INTERVAL = 100  # milliseconds
 
 
 def start_monitoring(seconds_frozen=SECONDS_FROZEN,
-                     test_interval=TEST_INTERVAL):
+                     test_interval=TEST_INTERVAL,
+                     kill_after=0):
     """Start monitoring for hanging threads.
 
     seconds_frozen - How much time should thread hang to activate
@@ -57,13 +59,29 @@ def start_monitoring(seconds_frozen=SECONDS_FROZEN,
 
     tests_interval - Sleep time of monitoring thread (in milliseconds) 
     - default(100)
+
+    kill_after - how much time to wait until killing thread (in seconds)
+
+    Note that killing only becomes effective once the thread is within python
+    code. I.e. if it sits in C code waiting for I/O, it will not exit.
     """
-    
+
     thread = StoppableThread(target=monitor, args=(seconds_frozen,
-                                                   test_interval))
+                                                   test_interval,
+                                                   kill_after))
     thread.daemon = True
     thread.start()
     return thread
+
+
+def try_kill(thread_id):
+    res = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        thread_id,
+        ctypes.py_object(SystemExit)
+    )
+    if res>1:
+        # failed, reset Exception
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
 
 
 class StoppableThread(threading.Thread):
@@ -83,7 +101,7 @@ class StoppableThread(threading.Thread):
         return self._stopped
 
 
-def monitor(seconds_frozen, test_interval):
+def monitor(seconds_frozen, test_interval, kill_after):
     """Monitoring thread function.
 
     Checks if thread is hanging for time defined by
@@ -105,6 +123,7 @@ def monitor(seconds_frozen, test_interval):
         time.sleep(test_interval/1000.)
         now = time.time()
         then = now - seconds_frozen
+        deadline = now - kill_after
         for thread_id, thread_data in new_threads.items():
             # Don't report the monitor thread.
             if thread_id == current_thread.ident:
@@ -129,6 +148,13 @@ def monitor(seconds_frozen, test_interval):
                     hanging_threads.add(thread_id)
                     # Report the hanged thread.
                     log_hanged_thread(thread_data, frame)
+                # hung for > kill time
+                if kill_after and last_change_time < deadline:
+                    log_kill(thread_data)
+                    try_kill(thread_data['id'])
+                    # reset timer, so that kill is not attempted over and over
+                    thread_data['time'] = now
+
         old_threads = new_threads
 
 
@@ -204,6 +230,9 @@ def log_died_thread(thread_data):
     hanging.
     """
     write_log('{0} died  '.format(threadcaption(thread_data)))
+
+def log_kill(thread_data):
+    write_log('Trying to kill {0}'.format(threadcaption(thread_data)))
 
 
 def write_log(title, message=''):
